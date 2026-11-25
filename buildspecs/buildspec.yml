@@ -1,0 +1,137 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+      nodejs: 22
+    commands:
+      - echo "Preparing SPA UNAS remote QA environment"
+      - python --version
+      - node --version
+      - npm --version
+      - git --version
+      - docker --version
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+
+        echo "=========================================="
+        echo "SPA UNAS - Remote QA Dispatcher"
+        echo "=========================================="
+
+        case "${REPO:-}" in
+          spa-backend-api|spa-frontend-web|spa-database)
+            ;;
+          *)
+            echo "ERROR: Invalid repository"
+            exit 1
+            ;;
+        esac
+
+        case "${SUITE:-}" in
+          humo|unitarias|integracion|todo)
+            ;;
+          *)
+            echo "ERROR: Invalid test suite"
+            exit 1
+            ;;
+        esac
+
+        case "$REPO:$SUITE" in
+          *:humo)
+            ;;
+          spa-backend-api:unitarias|spa-backend-api:integracion|spa-backend-api:todo)
+            ;;
+          spa-frontend-web:unitarias|spa-frontend-web:todo)
+            ;;
+          spa-database:integracion|spa-database:todo)
+            ;;
+          *)
+            echo "ERROR: Unsupported repository and suite combination"
+            exit 1
+            ;;
+        esac
+
+        QA_SCRIPT_DIR="$(mktemp -d)"
+        QA_WORK_DIR="$(mktemp -d)"
+
+        cleanup() {
+          rm -rf -- "$QA_SCRIPT_DIR" "$QA_WORK_DIR"
+        }
+
+        trap cleanup EXIT
+
+        printf '%s' '${humo_b64}' | base64 --decode > "$QA_SCRIPT_DIR/humo.sh"
+        printf '%s' '${backend_b64}' | base64 --decode > "$QA_SCRIPT_DIR/backend.sh"
+        printf '%s' '${database_b64}' | base64 --decode > "$QA_SCRIPT_DIR/database.sh"
+        printf '%s' '${frontend_b64}' | base64 --decode > "$QA_SCRIPT_DIR/frontend.sh"
+
+        echo "Repository: $REPO"
+        echo "Suite: $SUITE"
+
+        if [[ "$SUITE" == "humo" ]]; then
+          echo "Running infrastructure smoke test"
+          bash "$QA_SCRIPT_DIR/humo.sh"
+          exit 0
+        fi
+
+        if [[ -z "${REF:-}" ]]; then
+          echo "ERROR: Git reference is required"
+          exit 1
+        fi
+
+        if [[ "$REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          FETCH_REF="$REF"
+        elif [[ "$REF" =~ ^pull/[1-9][0-9]*/head$ ]]; then
+          FETCH_REF="refs/$REF"
+        elif [[ "$REF" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]] &&
+             git check-ref-format "refs/heads/$REF"; then
+          FETCH_REF="refs/heads/$REF"
+        else
+          echo "ERROR: Invalid Git reference"
+          exit 1
+        fi
+
+        REPO_URL="https://github.com/Proyecto-Maestria-Spa-Unas/$REPO.git"
+
+        echo "Reference: $REF"
+        echo "Cloning selected repository"
+
+        export GIT_TERMINAL_PROMPT=0
+
+        git init "$QA_WORK_DIR/repository"
+        git -C "$QA_WORK_DIR/repository" remote add origin "$REPO_URL"
+        git -C "$QA_WORK_DIR/repository" fetch --depth 1 origin "$FETCH_REF"
+        git -C "$QA_WORK_DIR/repository" checkout --detach FETCH_HEAD
+
+        echo "Resolved commit:"
+        git -C "$QA_WORK_DIR/repository" rev-parse HEAD
+
+        cd "$QA_WORK_DIR/repository"
+
+        case "$REPO" in
+          spa-backend-api)
+            bash "$QA_SCRIPT_DIR/backend.sh"
+            ;;
+          spa-frontend-web)
+            bash "$QA_SCRIPT_DIR/frontend.sh"
+            ;;
+          spa-database)
+            bash "$QA_SCRIPT_DIR/database.sh"
+            ;;
+        esac
+
+        echo "=========================================="
+        echo "REMOTE QA: PASSED"
+        echo "=========================================="
+
+  post_build:
+    commands:
+      - echo "Remote QA execution finished"
+      - echo "CodeBuild success indicator $CODEBUILD_BUILD_SUCCEEDING"
