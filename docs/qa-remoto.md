@@ -92,7 +92,7 @@ El responsable de infraestructura valida exclusivamente el
 funcionamiento del entorno mediante la prueba de humo.
 
 El responsable de QA, Jhon, ejecutará las pruebas funcionales
-una vez autorizado el acceso.
+después de configurar su MFA y verificar los permisos efectivos. Jhon administra sus propias credenciales y ejecuta las pruebas negativas y funcionales.
 
 ## 5. Estructura de archivos
 
@@ -109,6 +109,7 @@ spa-infra-aws/
     qa-remoto-evidencias.md
   scripts/
     qa-remoto.sh
+    qa-mfa.sh
   terraform/
     envs/
       qa-remoto/
@@ -140,43 +141,24 @@ las pruebas remotas.
 
 ## 7. Autenticación y configuración de AWS CLI
 
-El perfil utilizado por el script es:
+El flujo acordado en el PR #6 utiliza AWS STS y dos perfiles locales:
 
-```text
-spa-qa
-```
+| Perfil | Finalidad |
+|---|---|
+| spa-qa-base | Credencial individual de origen |
+| spa-qa | Sesión temporal autenticada con MFA |
 
-La región configurada es:
+### 7.1 Preparación del ejecutor
 
-```text
-us-east-1
-```
+El administrador entrega la URL de inicio de sesión y la contraseña inicial por un canal privado y seguro. El ejecutor cambia la contraseña en el primer ingreso y registra su propio MFA virtual con el nombre `spa-qa-jhon` desde Credenciales de seguridad. Debe cerrar sesión y volver a ingresar con MFA antes de gestionar sus claves de acceso. El procedimiento detallado de configuración inicial se encuentra en el [README](../README.md).
 
-El usuario QA deberá utilizar credenciales temporales asociadas
-a una sesión autenticada mediante MFA.
+### 7.2 Sesión desde Git Bash
 
-Si se autoriza el uso de una llave de acceso individual como
-credencial inicial, esta deberá ser creada y administrada
-exclusivamente por su propietario.
+Seguir el procedimiento de configuración y renovación de los perfiles `spa-qa-base` y `spa-qa` descrito en el README. El script `scripts/qa-mfa.sh` utiliza STS GetSessionToken, solicita una duración de 43200 segundos (12 horas), comprueba la identidad y comunica la expiración. No imprime las credenciales temporales. El código MFA no se muestra al introducirlo.
 
-La llave permanente no deberá utilizarse directamente para
-ejecutar CodeBuild. La política exige una sesión con MFA.
+La configuración local de AWS CLI guarda las credenciales sin cifrado propio. Debe protegerse el equipo y los archivos locales de credenciales; los argumentos de procesos pueden ser visibles localmente. No compartir claves, tokens, códigos MFA ni archivos de credenciales. No ejecutar con trazas de depuración.
 
-La configuración definitiva del mecanismo de autenticación
-queda condicionada a la aprobación del acceso por el grupo
-y a su validación efectiva en AWS.
-
-Verificar la identidad configurada:
-
-```bash
-aws sts get-caller-identity --profile spa-qa
-```
-
-Este comando permite comprobar la identidad, pero no demuestra
-por sí solo que la sesión cumpla el requisito de MFA.
-
-No compartir claves de acceso, tokens de sesión, códigos MFA
-ni archivos de credenciales.
+La renovación se realiza mediante el mismo procedimiento del README cuando expire la sesión. La comprobación de identidad no demuestra por sí sola que la sesión cumpla las condiciones IAM. La autenticación efectiva y las pruebas de autorización quedan pendientes del ejecutor QA.
 
 ## 8. Repositorios y suites disponibles
 
@@ -454,9 +436,105 @@ los repositorios, suites y parámetros de ejecución.
 No concede iam:PassRole ni permisos de administración
 de infraestructura.
 
-La administración de las credenciales individuales,
-si se autoriza, deberá realizarse mediante permisos
-separados y limitados al usuario propietario.
+### 12.2.1 Aprovisionamiento administrativo del ejecutor
+
+El administrador realizó la configuración fuera de Terraform, por lo que estos elementos no forman parte de los seis recursos del plan:
+
+- Grupo `spa-qa-executors` con la política `spa-qa-ejecutor`.
+- Usuario individual `spa-qa-jhon`, miembro del grupo.
+- Acceso inicial a consola con cambio obligatorio de contraseña y política `IAMUserChangePassword`.
+- Política individual insertada `spa-qa-self-management`, limitada al usuario propietario para el registro MFA y la gestión de claves propias.
+- Retiro de `SignInLocalDevelopmentAccess` del grupo QA, al adoptarse STS.
+
+El administrador no genera claves de acceso ni registra el dispositivo MFA del ejecutor. La contraseña inicial debe entregarse en privado. El ejecutor registra su MFA y administra sus propias claves. La política exige MFA para crear, listar y actualizar claves; no concede eliminación de claves ni desactivación del MFA. La recuperación del dispositivo corresponde al administrador. El listado de dispositivos MFA virtuales tiene alcance de cuenta. Los permisos efectivos aún no se han comprobado con la sesión del ejecutor.
+
+La configuración administrativa debe conservarse bajo control del administrador autorizado y revisarse antes de reproducirla en otra cuenta.
+
+#### Politica IAM de autogestion
+
+La siguiente politica individual, denominada `spa-qa-self-management`,
+fue configurada por el administrador directamente sobre el usuario IAM.
+
+Para reproducir la configuracion:
+
+1. Crear el grupo `spa-qa-executors`.
+2. Asociar al grupo la politica `spa-qa-ejecutor`.
+3. Crear el usuario individual `spa-qa-jhon`.
+4. Habilitar el acceso a consola con cambio obligatorio de contrasena.
+5. Incorporar el usuario al grupo.
+6. Verificar la asignacion de `IAMUserChangePassword`.
+7. Desde los permisos del usuario, crear una politica insertada
+   utilizando el siguiente documento JSON.
+8. Guardar la politica con el nombre `spa-qa-self-management`.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowReadAccountPasswordPolicy",
+      "Effect": "Allow",
+      "Action": "iam:GetAccountPasswordPolicy",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowListVirtualMFADevices",
+      "Effect": "Allow",
+      "Action": "iam:ListVirtualMFADevices",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowCreateOwnVirtualMFA",
+      "Effect": "Allow",
+      "Action": "iam:CreateVirtualMFADevice",
+      "Resource": "arn:aws:iam::*:mfa/${aws:username}"
+    },
+    {
+      "Sid": "AllowEnableAndReadOwnMFA",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetUser",
+        "iam:EnableMFADevice",
+        "iam:ListMFADevices"
+      ],
+      "Resource": "arn:aws:iam::*:user/${aws:username}"
+    },
+    {
+      "Sid": "AllowManageOwnAccessKeysWithMFA",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateAccessKey",
+        "iam:ListAccessKeys",
+        "iam:UpdateAccessKey"
+      ],
+      "Resource": "arn:aws:iam::*:user/${aws:username}",
+      "Condition": {
+        "Bool": {
+          "aws:MultiFactorAuthPresent": "true"
+        }
+      }
+    }
+  ]
+}
+```
+
+Consideraciones:
+
+- La variable `${aws:username}` limita las operaciones sobre
+  usuarios y dispositivos MFA al nombre del usuario autenticado.
+- El dispositivo MFA virtual debe llamarse `spa-qa-jhon`.
+- La creacion, consulta y actualizacion de claves requiere MFA.
+- La actualizacion permite activar o desactivar claves propias.
+- No se concede permiso para eliminar claves de acceso.
+- No se concede permiso para desactivar dispositivos MFA.
+- La consulta de la politica de contrasenas y el listado de
+  dispositivos MFA virtuales tienen alcance de cuenta.
+- La politica no contiene credenciales ni secretos.
+- El administrador no debe generar las claves del ejecutor QA.
+- La recuperacion de acceso corresponde al administrador autorizado.
+
+La configuracion efectiva de MFA y la gestion de claves deben
+ser verificadas por el ejecutor QA durante su primer acceso.
 
 ### 12.3 Protección de información
 
@@ -513,12 +591,7 @@ incluidas comunicaciones salientes.
 El entorno no constituye un aislamiento de seguridad
 suficiente para ejecutar código deliberadamente hostil.
 
-El acceso de Jhon queda condicionado a:
-
-1. Aprobación expresa de los riesgos por el grupo.
-2. Validación de la infraestructura desplegada.
-3. Verificación efectiva de la política IAM.
-4. Configuración individual de MFA.
+El PO aceptó expresamente los riesgos residuales en la revisión del [PR #6](https://github.com/Proyecto-Maestria-Spa-Unas/spa-infra-aws/pull/6). La infraestructura ya fue validada mediante la prueba de humo. Permanecen pendientes la configuración individual de MFA y la verificación efectiva de IAM por Jhon. La aceptación de riesgos no convierte el presupuesto ni el timeout configurado en límites absolutos.
 
 Si se requiere controlar estrictamente todos los parámetros
 de StartBuild, deberá evaluarse la opción B mediante un
@@ -650,7 +723,7 @@ con el equipo de infraestructura.
 | Problema | Acción recomendada |
 |---|---|
 | AccessDenied | Verificar sesión MFA, permisos y perfil |
-| ExpiredToken | Renovar la sesión temporal |
+| ExpiredToken | Renovar la sesión temporal según el README |
 | Repositorio inválido | Revisar los nombres autorizados |
 | Suite no soportada | Consultar la matriz de suites |
 | Referencia Git inválida | Verificar rama, PR o SHA |
@@ -693,10 +766,16 @@ con el equipo de infraestructura.
 | Terraform apply | 6 added, 0 changed, 0 destroyed |
 | Prueba de humo efectiva en AWS | SUCCEEDED |
 | Registros CloudWatch y limpieza temporal | PASS |
-| Retiro de permisos temporales de aprovisionamiento | Pendiente |
+| Retiro de permisos temporales de aprovisionamiento | Completado el 2026-11-24 |
+| Usuario IAM y asignación de política QA | Configurados |
+| Política individual de autogestión | Creada |
+| Aceptación de riesgos residuales | Aprobada por PO |
+| Script qa-mfa.sh | Creado; sintaxis Bash PASS |
+| Activación MFA y sesión STS del ejecutor | Pendiente |
+| Pruebas negativas reales | Pendiente |
 | Autorización efectiva del usuario QA | Pendiente |
 | Ejecución funcional por QA | Pendiente |
-| Pull Request hacia develop | Pendiente |
+| Pull Request hacia develop | PR #6 creado; checks iniciales 3/3 exitosos; revisión pendiente de cierre |
 
 Las validaciones locales no constituyen evidencia de
 ejecución efectiva en AWS.
@@ -719,6 +798,8 @@ La autorización efectiva del ejecutor QA y las pruebas funcionales siguen pendi
 - Riesgos residuales aprobados por el grupo.
 - Documentación técnica disponible.
 - Pull Request hacia develop con evidencias sanitizadas.
+- Pruebas negativas reales por el ejecutor: sin MFA, intento de override del buildspec, repositorio no autorizado y suite humo. Resultado esperado: AccessDenied. No se han ejecutado todavía.
+- Primera ejecución funcional de los tres repositorios por Jhon y registro de resultados para la aceptación del issue #5.
 
 ## 19. Referencias oficiales
 
@@ -762,4 +843,4 @@ a DV5 ni DV7.
 
 Las evidencias del despliegue se encuentran en
 [qa-remoto-evidencias.md](qa-remoto-evidencias.md).
-El Pull Request y el retiro de permisos temporales siguen pendientes.
+El retiro de permisos temporales se completó el 24 de noviembre de 2026. El [PR #6](https://github.com/Proyecto-Maestria-Spa-Unas/spa-infra-aws/pull/6) fue creado hacia develop. Las correcciones de la revisión se incorporan al mismo PR, asociado al [issue #5](https://github.com/Proyecto-Maestria-Spa-Unas/spa-infra-aws/issues/5). La aceptación definitiva sigue pendiente de las validaciones de QA.
